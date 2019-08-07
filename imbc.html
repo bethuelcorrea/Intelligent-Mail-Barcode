@@ -1,0 +1,1809 @@
+
+<html>
+
+<head>
+
+<title>2.0Intelligent Mail Barcode Decoder</title>
+
+<meta http-equiv="Content-Script-Type" content="text/javascript">
+
+<meta http-equiv="Content-Style-Type" content="text/css">
+
+</head>
+
+<body>
+
+
+
+<script>
+
+// barcode-to-bit permutation
+
+var desc_char = [7,1,9,5,8,0,2,4,6,3,5,8,9,7,3,0,6,1,7,4,6,8,9,2,5,1,7,5,4,3,
+
+8,7,6,0,2,5,4,9,3,0,1,6,8,2,0,4,5,9,6,7,5,2,6,3,8,5,1,9,8,7,4,0,2,6,3];
+
+var desc_bit = [4,1024,4096,32,512,2,32,16,8,512,2048,32,1024,2,64,8,16,2,
+
+1024,1,4,2048,256,64,2,4096,8,256,64,16,16,2048,1,64,2,512,2048,32,8,128,8,
+
+1024,128,2048,256,4,1024,8,32,256,1,8,4096,2048,256,16,32,2,8,1,128,4096,512,
+
+256,1024];
+
+var asc_char = [4,0,2,6,3,5,1,9,8,7,1,2,0,6,4,8,2,9,5,3,0,1,3,7,4,6,8,9,2,0,5,
+
+1,9,4,3,8,6,7,1,2,4,3,9,5,7,8,3,0,2,1,4,0,9,1,7,0,2,4,6,3,7,1,9,5,8];
+
+var asc_bit = [8,1,256,2048,2,4096,256,2048,1024,64,16,4096,4,128,512,64,128,
+
+512,4,256,16,1,4096,128,1024,512,1,128,1024,32,128,512,64,256,4,4096,2,16,4,1,
+
+2,32,16,64,4096,2,1,512,16,128,32,1024,4,64,512,2048,4,4096,64,128,32,2048,1,
+
+8,4];
+
+
+
+// build tables of 13-bit codewords
+
+var encode_table = new Array(1365);
+
+var decode_table = new Array(8192);
+
+var fcs_table = new Array(8192);
+
+function build_codewords(bits, low, hi) {
+
+  var fwd, rev, pop, tmp, bit;
+
+  // loop through all possible 13-bit codewords
+
+  for (fwd = 0; fwd < 8192; fwd++) {
+
+    // build reversed codeword and count population of 1-bits
+
+    pop = 0;
+
+    rev = 0;
+
+    tmp = fwd;
+
+    for (bit = 0; bit < 13; bit++) {
+
+      pop += tmp & 1;
+
+      rev = (rev << 1) | (tmp & 1);
+
+      tmp >>= 1;
+
+    }
+
+    if (pop != bits) continue;
+
+
+
+    if (fwd == rev) {
+
+      // palindromic codes go at the end of the table
+
+      encode_table[hi] = fwd;
+
+      decode_table[fwd] = hi;
+
+      decode_table[fwd ^ 8191] = hi;
+
+      fcs_table[fwd] = 0;
+
+      fcs_table[fwd ^ 8191] = 1;
+
+      hi--;
+
+    }
+
+    else if (fwd < rev) {
+
+      // add foreward code to front of table
+
+      encode_table[low] = fwd;
+
+      decode_table[fwd] = low;
+
+      decode_table[fwd ^ 8191] = low;
+
+      fcs_table[fwd] = 0;
+
+      fcs_table[fwd ^ 8191] = 1;
+
+      low++;
+
+
+
+      // add reversed code to front of table
+
+      encode_table[low] = rev;
+
+      decode_table[rev] = low;
+
+      decode_table[rev ^ 8191] = low;
+
+      fcs_table[rev] = 0;
+
+      fcs_table[rev ^ 8191] = 1;
+
+      low++;
+
+    }
+
+  }
+
+}
+
+build_codewords(5,    0, 1286);
+
+build_codewords(2, 1287, 1364);
+
+
+
+function add(bytes, add) {
+
+  // bytes is an array of bytes representing a multiple-precision number.
+
+  // add "add" to bytes.
+
+  var n, x;
+
+  for (n = bytes.length - 1; n >= 0 && add != 0; n--) {
+
+    x = bytes[n] + add;
+
+    add = x >> 8;
+
+    bytes[n] = x & 0xff;
+
+  }
+
+}
+
+
+
+function muladd(bytes, mult, add) {
+
+  // bytes is an array of bytes representing a multiple-precision number.
+
+  // multiply bytes by "mult" and add "add".
+
+  // assuming 32-bit integers, the largest mult can be without overflowing
+
+  // is about 2**23, or approximately 8 million.
+
+  var n, x;
+
+  for (n = bytes.length - 1; n >= 0; n--) {
+
+    x = bytes[n]*mult + add;
+
+    add = x >> 8;
+
+    bytes[n] = x & 0xff;
+
+  }
+
+}
+
+
+
+function divmod(bytes, div) {
+
+  // bytes is an array of bytes representing a multiple-precision number.
+
+  // divide bytes by "div" and return remainder.
+
+  // div is limited the same way as mult above.
+
+  var mod = 0;
+
+  var n, x, q, len = bytes.length;
+
+  for (n = 0; n < len; n++) {
+
+    x = bytes[n] + (mod << 8);
+
+    bytes[n] = q = Math.floor(x / div);
+
+    mod = x - q*div;
+
+  }
+
+  return mod;
+
+}
+
+
+
+function iszero(bytes) {
+
+  // bytes is an array of bytes representing a multiple-precision number.
+
+  // see if all bytes are zero.
+
+  var n;
+
+  for (n = bytes.length - 1; n >= 0; n--)
+
+    if (bytes[n] != 0)
+
+      return false;
+
+  return true;
+
+}
+
+
+
+function calcfcs(bytes) {
+
+  // calculate 11-bit frame check sequence for an array of bytes.
+
+  var fcs = 0x5a8;
+
+  // iterating the bit loop twice on the initial value of fcs yeilds 0x7ff,
+
+  // which is the proper starting value when the first two bits are skipped.
+
+  var n, bit, len = bytes.length;
+
+  for (n = 0; n < len; n++) {
+
+    fcs ^= bytes[n] << 3;
+
+    for (bit = 0; bit < 8; bit++) {
+
+      fcs <<= 1;
+
+      if (fcs & 0x800) fcs ^= 0xf35;
+
+    }
+
+  }
+
+  return fcs;
+
+}
+
+
+
+function despace(str) {
+
+  return str.replace(/\s+/g, "");
+
+}
+
+
+
+function nondigits(str) {
+
+  return !!/\D/.exec(str);
+
+}
+
+
+
+function text_to_chars(barcode, strict) {
+
+  // convert barcode text to "characters" by applying bit permutation
+
+  barcode = despace(barcode);
+
+  var chars = [0,0,0,0,0,0,0,0,0,0];
+
+  var n;
+
+  for (n = 0; n < 65; n++) {
+
+    switch (barcode.charAt(n)) {
+
+      case 'T':  // track bar
+
+        break;
+
+      case 'D':  // descending bar
+
+        chars[desc_char[n]] |= desc_bit[n];
+
+        break;
+
+      case 'A':  // ascending bar
+
+        chars[asc_char[n]] |= asc_bit[n];
+
+        break;
+
+      case 'F':  // full bar
+
+        chars[desc_char[n]] |= desc_bit[n];
+
+        chars[asc_char[n]] |= asc_bit[n];
+
+        break;
+
+      default:
+
+        if (strict) return null;
+
+    }
+
+  }
+
+  return chars;
+
+}
+
+
+
+function chars_to_text(chars) {
+
+  var barcode = "";
+
+  for (n = 0; n < 65; n++) {
+
+    if (chars[desc_char[n]] & desc_bit[n]) {
+
+      if (chars[asc_char[n]] & asc_bit[n])
+
+        barcode += "F";
+
+      else
+
+        barcode += "D";
+
+    }
+
+    else {
+
+      if (chars[asc_char[n]] & asc_bit[n])
+
+        barcode += "A";
+
+      else
+
+        barcode += "T";
+
+    }
+
+  }
+
+  return barcode;
+
+}
+
+
+
+function decode_chars(chars) {
+
+  // decode characters to codewords.
+
+  // this is the core of the barcode processing.
+
+
+
+  var cw = new Array(10);
+
+  var fcs = 0;
+
+  var n;
+
+  for (n = 0; n < 10; n++) {
+
+    cw[n] = decode_table[chars[n]];
+
+    if (cw[n] === undefined) return null;
+
+    fcs |= fcs_table[chars[n]] << n;
+
+  }
+
+
+
+  // codewords valid?
+
+  if (cw[0] > 1317 || cw[9] > 1270) {
+
+    return;
+
+  }
+
+  if (cw[9] & 1) {
+
+    // If the barcode is upside down, cw[9] will always be odd.
+
+    // This is due to properties of the bit permutation and the
+
+    // codeword table.
+
+    return null;
+
+  }
+
+  cw[9] >>= 1;
+
+  if (cw[0] > 658) {
+
+    cw[0] -= 659;
+
+    fcs |= 1 << 10;
+
+  }
+
+
+
+  // convert codewords to binary
+
+  var bytes = [0,0,0,0,0,0,0,0,0,0,0,0,cw[0]];
+
+  for (n = 1; n < 9; n++)
+
+    muladd(bytes, 1365, cw[n]);
+
+  muladd(bytes, 636, cw[9]);
+
+
+
+  if (calcfcs(bytes) != fcs) return null;
+
+
+
+  // decode tracking information
+
+  var track = new Array(20);
+
+  for (n = 19; n >= 2; n--)
+
+    track[n] = divmod(bytes, 10);
+
+  track[1] = divmod(bytes, 5);
+
+  track[0] = divmod(bytes, 10);
+
+
+
+  // decode routing information (zip code, etc)
+
+  var route = new Array(11);
+
+  var pos = 11;
+
+  var sz;
+
+  for (sz = 5; sz >= 2; sz--) {
+
+    if (sz == 3) continue;
+
+    if (iszero(bytes)) break;
+
+    add(bytes, -1);
+
+    for (n = 0; n < sz; n++)
+
+      route[--pos] = divmod(bytes, 10);
+
+  }
+
+  if (sz < 2 && !iszero(bytes)) return null;
+
+
+
+  // finally finished decoding
+
+  inf = new Object();
+
+  inf.barcode_id = track.slice(0,2).join('');
+
+  inf.service_type = track.slice(2,5).join('');
+
+  if (track[5] == 9) {
+
+    inf.mailer_id = track.slice(5,14).join('');
+
+    inf.serial_num = track.slice(14,20).join('');
+
+  }
+
+  else {
+
+    inf.mailer_id = track.slice(5,11).join('');
+
+    inf.serial_num = track.slice(11,20).join('');
+
+  }
+
+  if (pos <= 6) inf.zip = route.slice(pos,pos+5).join('');
+
+  if (pos <= 2) inf.plus4 = route.slice(pos+5,pos+9).join('');
+
+  if (pos == 0) inf.delivery_pt = route.slice(9,11).join('');
+
+
+//new added code! serviceCodeDescription New
+serviceCodeDescription();
+//end of added code! seriveCodeDescription New
+
+  return inf;
+
+}
+
+//new function to take care of service code New
+
+function serviceCodeDescription(){
+
+  var serviceCode = inf.service_type; 
+  serviceCode = Number(serviceCode);
+    
+switch (serviceCode) {
+  case 030:
+    serviceCode = "Reply Mail by MID|Courtesy Reply Mail"+'<br>NOTES :'+" Nonautomation with IMb IV";
+    break;
+  case 031:
+    serviceCode = "Reply Mail by MID|First-Class Reply Mail|Nonautomation with IMb IV";
+    break;
+  case 032:
+    serviceCode = "Reply Mail by MID|Business Reply Mail|Nonautomation with IMb IV";
+    break;
+  case 036:
+    serviceCode = "First-Class Mail|Manual Corrections|Full-Service w/o IMb IV";
+    break;
+  case 037:
+    serviceCode = "Standard Mail|Manual Corrections|Full-Service w/o IMb IV";
+    break;
+  case 038:
+    serviceCode = "Periodicals|Full Service ACS|Full-Service w/o IMb IV";
+    break;
+  case 040:
+    serviceCode = "First-Class Mail|Manual Corrections|Nonautomation with IMb IV";
+    break;
+  case 042:
+    serviceCode = "Standard Mail|Manual Corrections|Nonautomation with IMb IV";
+    break;
+  case 044:
+    serviceCode = "Periodicals|Manual Corrections|Nonautomation with IMb IV";
+    break;
+  case 050:
+    serviceCode = "Reply Mail by ZIP|Courtesy Reply Mail|Nonautomation with IMb IV";
+    break;
+  case 051:
+    serviceCode = "Reply Mail by ZIP|First-Class Reply Mail (PRM)|Nonautomation with IMb IV";
+    break;
+  case 052:
+    serviceCode = "Reply Mail by ZIP|Business Reply Mail|Nonautomation with IMb IV";
+    break;
+  case 070:
+    serviceCode = "Reply Mail by MID|Courtesy Reply Mail|Nonautomation w/o IMb IV";
+    break;
+  case 071:
+    serviceCode = "Reply Mail by MID|First-Class Reply Mail|Nonautomation w/o IMb IV";
+    break;
+  case 072:
+    serviceCode = "Reply Mail by MID|Business Reply Mail|Nonautomation w/o IMb IV";
+    break;
+  case 080:
+    serviceCode = "First-Class Mail|OneCode ACS – ASR 2 Address Service Requested Opt 2|Nonautomation w/o IMb IV";
+    break;
+  case 081:
+    serviceCode = "First-Class Mail|Full-Service ACS – ASR 2 Address Service Requested Opt 2|Full-Service w/o IMb IV";
+    break;
+  case 082:
+    serviceCode = "First-Class Mail|OneCode ACS – CSR 2 Change Service Requested Opt 2|Nonautomation w/o IMb IV";
+    break;
+  case 083:
+    serviceCode = "First-Class Mail|Full-Service ACS – CSR 2 Change Service Requested Opt 2|Full-Service w/o IMb IV";
+    break;
+  case 090:
+    serviceCode = "Standard Mail|OneCode ACS – ASR 1* Address Service Requested Opt 1|Nonautomation w/o IMb IV";
+    break;
+  case 091:
+    serviceCode = "Standard Mail|Full-Service ACS– ASR 1* Address Service Requested Opt 1|Full-Service w/o IMb IV";
+    break;
+  case 092:
+    serviceCode = "Standard Mail|OneCode ACS – CSR1* Change Service Requested Opt 1|Nonautomation w/o IMb IV";
+    break;
+  case 093:
+    serviceCode = "Standard Mail|Full-Service ACS – CSR 1* Change Service Requested Opt 1|Full-Service w/o IMb IV";
+    break;
+  case 140:
+    serviceCode = "First-Class Mail|OneCode ACS – ASR 2 Address Service Requested Opt 2|Nonautomation with IMb IV";
+    break;
+  case 142:
+    serviceCode = "142|Standard Mail|OneCode ACS – ASR 1* Address Service Requested Opt 1|Nonautomation with IMb IV";
+    break;
+  case 220:
+    serviceCode = "220|First-Class Mail|OneCode ACS – ASR 1 Address Service Requested Opt 1|Nonautomation with IMb IV";
+    break;
+  case 230:
+    serviceCode = "230|First-Class Mail|OneCode ACS – ASR 1 Address Service Requested Opt 1|Nonautomation w/o IMb IV";
+    break;
+  case 232:
+    serviceCode = "232|First-Class Mail|Full-Service ACS – TRSR 2 Temp-Return Service Requested Opt|Full-Service w/o IMb IV";
+    break;
+  case 240:
+    serviceCode = "240|First-Class Mail|OneCode ACS – CSR 2 Change Service Requested Opt 2|Nonautomation with IMb IV";
+    break;
+  case 242:
+    serviceCode = "242|Standard Mail|OneCode ACS – CSR1* Change Service Requested Opt 1|Nonautomation with IMb IV";
+    break;
+  case 244:
+    serviceCode = "244|Periodicals|OneCode ACS|Nonautomation with IMb IV";
+    break;
+  case 260:
+    serviceCode = "260|First-Class Mail|No Address Corrections|Full-Service w/o IMb IV";
+    break;
+  case 261:
+    serviceCode = "261|Standard Mail|No Address Corrections|Full-Service w/o IMb IV";
+    break;
+  case 262:
+    serviceCode = "262|Standard Mail|OneCode ACS – RSR 2* Return Service Requested Opt 2|Nonautomation with IMb IV";
+    break;
+  case 264:
+    serviceCode = "264|Periodicals|Manual Corrections|Full-Service w/o IMb IV";
+    break;
+  case 265:
+    serviceCode = "265|Bound Printed Matter|No Address Corrections|Full-Service w/o IMb IV";
+    break;
+  case 272:
+    serviceCode = "272|Standard Mail|OneCode ACS – RSR 2* Return Service Requested Opt 2|Nonautomation w/o IMb IV";
+    break;
+  case 300:
+    serviceCode = "300|First-Class Mail|No Address Corrections|Nonautomation w/o IMb IV";
+    break;
+  case 301:
+    serviceCode = "301|Standard Mail|No Address Corrections|Nonautomation w/o IMb IV";
+    break;
+  case 310:
+    serviceCode = "310|First-Class Mail|No Address Corrections|Nonautomation with IMb IV";
+    break;
+  case 311:
+    serviceCode = "311|Standard Mail|No Address Corrections|Nonautomation with IMb IV";
+    break;
+  case 320:
+    serviceCode = "320|First-Class Mail|Full-Service ACS– ASR 1 Address Service Requested Opt 1|Full-Service w/o IMb IV";
+    break;
+  case 334:
+    serviceCode = "334|Standard Mail|OneCode ACS – ASR 2* Address Service Requested Opt 2|Nonautomation w/o IMb IV";
+    break;
+  case 340:
+    serviceCode = "340|First-Class Mail|OneCode ACS – RSR 2 Return Service Requested Opt 2|Nonautomation with IMb IV";
+    break;
+  case 341:
+    serviceCode = "341|First-Class Mail|OneCode ACS – RSR 2 Return Service Requested Opt 2|Nonautomation w/o IMb IV";
+    break;
+  case 343:
+    serviceCode = "343|First-Class Mail|Full-Service ACS – RSR 2 Return Service Requested Opt 2|Full-Service w/o IMb IV";
+    break;
+  case 344:
+    serviceCode = "344|First-Class Mail|OneCode ACS – TRSR 2 Temp-Return Service Requested Opt 2 T|Nonautomation with IMb IV";
+    break;
+  case 345:
+    serviceCode = "345|First-Class Mail|OneCode ACS – TRSR 2 Temp-Return Service Requested Opt 2 T|Nonautomation w/o IMb IV";
+    break;
+  case 401:
+    serviceCode = "401|Bound Printed Matter|No Address Corrections|Nonautomation w/o IMb IV";
+    break;
+  case 423:
+    serviceCode = "423|Bound Printed Matter|Full Service ACS– ASR 1* Address Service Requested Opt 1|Full-Service w/o IMb IV";
+    break;
+  case 424:
+    serviceCode = "424|Bound Printed Matter|OneCode ACS – ASR 1* Address Service Requested Opt 1|Nonautomation w/o IMb IV";
+    break;
+  case 430:
+    serviceCode = "430|Bound Printed Matter|Full Service ACS – CSR 1* Change Service Requested Opt 1|Full-Service w/o IMb IV";
+    break;
+  case 431:
+    serviceCode = "431|Bound Printed Matter|OneCode ACS – CSR 1* Change Service Requested Opt 1|Nonautomation w/o IMb IV";
+    break;
+  case 451:
+    serviceCode = "451|Bound Printed Matter|No Address Corrections|Nonautomation with IMb IV ";
+    break;
+  case 452:
+    serviceCode = "452|Bound Printed Matter|Manual Corrections|Nonautomation with IMb IV";
+    break;
+  case 453:
+    serviceCode = "453|Bound Printed Matter|OneCode ACS – ASR 1* Address Service Requested Opt 1|Nonautomation with IMb IV";
+    break;
+  case 454:
+    serviceCode = "454|Bound Printed Matter|OneCode ACS – ASR 2* Address Service Requested Opt 2|Nonautomation with IMb IV";
+    break;
+  case 455:
+    serviceCode = "455|Bound Printed Matter|OneCode ACS – CSR 1* Change Service Requested Opt 1|Nonautomation with IMb IV";
+    break;
+  case 456:
+    serviceCode = "456|Bound Printed Matter|OneCode ACS – CSR 2* Change Service Requested Opt 2|Nonautomation with IMb IV";
+    break;
+  case 457:
+    serviceCode = "457|Bound Printed Matter|OneCode ACS – RSR 2* Return Service Requested Opt 2|Nonautomation with IMb IV";
+    break;
+  case 458:
+    serviceCode = "458|Bound Printed Matter|Traditional ACS– ASR 1* Address Service Requested Opt 1|Nonautomation with IMb IV";
+    break;
+  case 459:
+    serviceCode = "459|Bound Printed Matter|Traditional ACS – ASR 2* Address Service Requested Opt 2|Nonautomation with IMb IV";
+    break;
+  case 460:
+    serviceCode = "460|Bound Printed Matter|Traditional ACS – CSR 1* Change Service Requested Opt 1|Nonautomation with IMb IV";
+    break;
+  case 461:
+    serviceCode = "461|Bound Printed Matter|Traditional ACS – CSR 2* Change Service Requested Opt 2|Nonautomation with IMb IV";
+    break;
+  case 462:
+    serviceCode = "462|Bound Printed Matter|Traditional ACS – RSR 2* Return Service Requested Opt 2|Nonautomation with IMb IV";
+    break;
+  case 466:
+    serviceCode = "466|Bound Printed Matter|Manual Corrections|Full-Service w/o IMb IV";
+    break;
+  case 500:
+    serviceCode = "500|First-Class Mail|Traditional ACS– ASR 1* Address Service Requested Opt 1|Nonautomation with IMb IV";
+    break;
+  case 501:
+    serviceCode = "501|First-Class Mail|Traditional ACS– ASR 1* Address Service Requested Opt 1|Nonautomation w/o IMb IV";
+    break;
+  case 502:
+    serviceCode = "502|First-Class Mail|OneCode ACS – CSR1 Change Service Requested Opt 1|Nonautomation with IMb IV";
+    break;
+  case 504:
+    serviceCode = "504|First-Class Mail|OneCode ACS – CSR1 Change Service Requested Opt 1|Nonautomation w/o IMb IV";
+    break;
+  case 505:
+    serviceCode = "505|First-Class Mail|Traditional ACS– ASR 1* Address Service Requested Opt 1|Full-Service w/o IMb IV";
+    break;
+  case 506:
+    serviceCode = "506|First-Class Mail|Traditional ACS – ASR 2* Address Service Requested Opt 2|Nonautomation with IMb IV";
+    break;
+  case 507:
+    serviceCode = "507|First-Class Mail|Traditional ACS – ASR 2* Address Service Requested Opt 2|Nonautomation w/o IMb IV";
+    break;
+  case 509:
+    serviceCode = "509|First-Class Mail|Traditional ACS – ASR 2* Address Service Requested Opt 2|Full-Service w/o IMb IV";
+    break;
+  case 510:
+    serviceCode = "510|First-Class Mail|Traditional ACS – CSR 2* Change Service Requested Opt 2|Nonautomation w/o IMb IV";
+    break;
+  case 512:
+    serviceCode = "512|First-Class Mail|Traditional ACS – CSR 2* Change Service Requested Opt 2|Full-Service w/o IMb IV";
+    break;
+  case 513:
+    serviceCode = "513|Standard Mail|OneCode ACS – CSR 2* Change Service Requested Opt 2|Nonautomation w/o IMb IV";
+    break;
+  case 515:
+    serviceCode = "515|First-Class Mail|Traditional ACS – CSR 1* Change Service Requested Opt 1|Nonautomation with IMb IV";
+    break;
+  case 516:
+    serviceCode = "516|First-Class Mail|Full-Service ACS – CSR 1 Change Service Requested Opt 1|Full-Service w/o IMb IV";
+    break;
+  case 517:
+    serviceCode = "517|First-Class Mail|Traditional ACS – CSR 1* Change Service Requested Opt 1|Nonautomation w/o IMb IV";
+    break;
+  case 521:
+    serviceCode = "521|First-Class Mail|Traditional ACS – CSR 1* Change Service Requested Opt 1|Full-Service w/o IMb IV";
+    break;
+  case 529:
+    serviceCode = "529|Standard Mail|Full-Service ACS – RSR 2* Return Service Requested Opt 2|Full-Service w/o IMb IV";
+    break;
+  case 530:
+    serviceCode = "530|First-Class Mail|Traditional ACS – CSR 2* Change Service Requested Opt 2|Nonautomation with IMb IV";
+    break;
+  case 534:
+    serviceCode = "534|First-Class Mail|Traditional ACS – RSR 2* Return Service Requested Opt 2|Nonautomation with IMb IV";
+    break;
+  case 535:
+    serviceCode = "535|First-Class Mail|Traditional ACS – RSR 2* Return Service Requested Opt 2|Nonautomation w/o IMb IV";
+    break;
+  case 537:
+    serviceCode = "537|First-Class Mail|Traditional ACS – RSR 2* Return Service Requested Opt 2|Full-Service w/o IMb IV";
+    break;
+  case 538:
+    serviceCode = "538|First-Class Mail|Traditional ACS – TRSR 2* Temp-Return Service Requested Opt 2|Nonautomation with IMb IV";
+    break;
+  case 539:
+    serviceCode = "539|Standard Mail|Traditional ACS– ASR 1* Address Service Requested Opt 1|Nonautomation with IMb IV";
+    break;
+  case 540:
+    serviceCode = "540|Standard Mail|Traditional ACS– ASR 1* Address Service Requested Opt 1|Nonautomation w/o IMb IV";
+    break;
+  case 542:
+    serviceCode = "542|Standard Mail|Traditional ACS– ASR 1* Address Service Requested Opt 1|Full-Service w/o IMb IV";
+    break;
+  case 543:
+    serviceCode = "543|First-Class Mail|Traditional ACS – TRSR 2* Temp-Return Service Requested Opt 2|Nonautomation w/o IMb IV";
+    break;
+  case 545:
+    serviceCode = "545|First-Class Mail|Traditional ACS – TRSR 2* Temp-Return Service Requested Opt 2|Full-Service w/o IMb IV";
+    break;
+  case 546:
+    serviceCode = "546|Standard Mail|Traditional ACS – ASR 2* Address Service Requested Opt 2|Nonautomation with IMb IV";
+    break;
+  case 547:
+    serviceCode = "547|Standard Mail|Traditional ACS – ASR 2* Address Service Requested Opt 2|Nonautomation w/o IMb IV";
+    break;
+  case 550:
+    serviceCode = "550|Standard Mail|Full-Service ACS – ASR 2* Address Service Requested Opt 2|Full-Service w/o IMb IV";
+    break;
+  case 551:
+    serviceCode = "551|Standard Mail|Traditional ACS – ASR 2* Address Service Requested Opt 2|Full-Service w/o IMb IV";
+    break;
+  case 559:
+    serviceCode = "559|Standard Mail|Traditional ACS – CSR 1* Change Service Requested Opt 1|Nonautomation with IMb IV";
+    break;
+  case 560:
+    serviceCode = "560|Standard Mail|Traditional ACS – CSR 1* Change Service Requested Opt 1|Nonautomation w/o IMb IV";
+    break;
+  case 562:
+    serviceCode = "562|Standard Mail|Traditional ACS – CSR 1* Change Service Requested Opt 1|Full-Service w/o IMb IV";
+    break;
+  case 564:
+    serviceCode = "564|Standard Mail|Traditional ACS – CSR 2* Change Service Requested Opt 2|Nonautomation with IMb IV";
+    break;
+  case 565:
+    serviceCode = "565|Standard Mail|Traditional ACS – CSR 2* Change Service Requested Opt 2|Nonautomation w/o IMb IV";
+    break;
+  case 567:
+    serviceCode = "567|Standard Mail|Full-Service ACS – CSR 2* Change Service Requested Opt 2|Full-Service w/o IMb IV ";
+    break;
+  case 568:
+    serviceCode = "568|Standard Mail|Traditional ACS – CSR 2* Change Service Requested Opt 2|Full-Service w/o IMb IV ";
+    break;
+  case 569:
+    serviceCode = "569|Standard Mail|Traditional ACS – RSR 2* Return Service Requested Opt 2|Nonautomation with IMb IV";
+    break;
+  case 570:
+    serviceCode = "570|Standard Mail|Traditional ACS – RSR 2* Return Service Requested Opt 2|Nonautomation w/o IMb IV";
+    break;
+  case 572:
+    serviceCode = "572|Standard Mail|Traditional ACS – RSR 2* Return Service Requested Opt 2|Full-Service w/o IMb IV";
+    break;
+  case 585:
+    serviceCode = "585|Standard Mail|OneCode ACS – ASR 2* Address Service Requested Opt 2|Nonautomation with IMb IV";
+    break;
+  case 586:
+    serviceCode = "586|Standard Mail|OneCode ACS – CSR 2* Change Service Requested Opt 2|Nonautomation with IMb IV";
+    break;
+  case 599:
+    serviceCode = "599|Periodicals|Traditional ACS|Nonautomation with IMb IV";
+    break;
+  case 600:
+    serviceCode = "600|Periodicals|Traditional ACS|Nonautomation w/o IMb IV";
+    break;
+  case 602:
+    serviceCode = "602|Periodicals|Traditional ACS|Full-Service w/o IMb IV";
+    break;
+  case 603:
+    serviceCode = "603|Bound Printed Matter|Traditional ACS– ASR 1* Address Service Requested Opt 1|Nonautomation w/o IMb IV";
+    break;
+  case 604:
+    serviceCode = "604|Bound Printed Matter|Traditional ACS– ASR 1* Address Service Requested Opt 1|Full-Service w/o IMb IV";
+    break;
+  case 605:
+    serviceCode = "605|Bound Printed Matter|OneCode ACS – ASR 2* Address Service Requested Opt 2|Nonautomation w/o IMb IV";
+    break;
+  case 606:
+    serviceCode = "606|Bound Printed Matter|Traditional ACS – ASR 2* Address Service Requested Opt 2|Nonautomation w/o IMb IV";
+    break;
+  case 607:
+    serviceCode = "607|Bound Printed Matter|Full-Service ACS – ASR 2* Address Service Requested Opt 2|Full-Service w/o IMb IV";
+    break;
+  case 608:
+    serviceCode = "608|Bound Printed Matter|Traditional ACS – ASR 2* Address Service Requested Opt 2|Full-Service w/o IMb IV";
+    break;
+  case 613:
+    serviceCode = "613|Bound Printed Matter|Traditional ACS – CSR 1* Change Service Requested Opt 1|Nonautomation w/o IMb IV";
+    break;
+  case 614:
+    serviceCode = "614|Bound Printed Matter|Traditional ACS – CSR 1* Change Service Requested Opt 1|Full-Service w/o IMb IV";
+    break;
+  case 615:
+    serviceCode = "615|Bound Printed Matter|OneCode ACS – CSR 2* Change Service Requested Opt 2|Nonautomation w/o IMb IV";
+    break;
+  case 616:
+    serviceCode = "616|Bound Printed Matter|Traditional ACS – CSR 2* Change Service Requested Opt 2|Nonautomation w/o IMb IV";
+    break;
+  case 617:
+    serviceCode = "617|Bound Printed Matter|Full Service ACS – CSR 2* Change Service Requested Opt 2|Full-Service w/o IMb IV";
+    break;
+  case 618:
+    serviceCode = "618|Bound Printed Matter|Traditional ACS – CSR 2* Change Service Requested Opt 2|Full-Service w/o IMb IV";
+    break;
+  case 619:
+    serviceCode = "619|Bound Printed Matter|OneCode ACS – RSR 2* Return Service Requested Opt 2|Nonautomation w/o IMb IV";
+    break;
+  case 620:
+    serviceCode = "620|Bound Printed Matter|Traditional ACS – RSR 2* Return Service Requested Opt 2|Nonautomation w/o IMb IV";
+    break;
+  case 621:
+    serviceCode = "621|Bound Printed Matter|Full Service ACS – RSR 2* Return Service Requested Opt 2|Full-Service w/o IMb IV";
+    break;
+  case 622:
+    serviceCode = "622|Bound Printed Matter|Traditional ACS – RSR 2* Return Service Requested Opt 2|Full-Service w/o IMb IV";
+    break;
+  case 700:
+    serviceCode = "700|First-Class Mail|Manual Corrections|Nonautomation w/o IMb IV";
+    break;
+  case 701:
+    serviceCode = "701|Reply Mail by ZIP|First-Class Reply Mail (PRM)|Nonautomation w/o IMb IV";
+    break;
+  case 702:
+    serviceCode = "702|Standard Mail|Manual Corrections|Nonautomation w/o IMb IV";
+    break;
+  case 703:
+    serviceCode = "703|Reply Mail by ZIP|Courtesy Reply Mail|Nonautomation w/o IMb IV";
+    break;
+  case 704:
+    serviceCode = "704|Periodicals|Manual Corrections|Nonautomation w/o IMb IV";
+    break;
+  case 706:
+    serviceCode = "706|Bound Printed Matter|Manual Corrections|Nonautomation w/o IMb IV";
+    break;
+  case 708:
+    serviceCode = "708|Reply Mail by ZIP|Business Reply Mail|Nonautomation w/o IMb IV";
+    break;
+  case 710:
+    serviceCode = "710|Priority Mail|Priority Mail|Nonautomation w/o IMb IV";
+    break;
+  case 712:
+    serviceCode = "712|Priority Mail|Priority Mail Flat Rate|Nonautomation w/o IMb IV";
+    break;
+  case 733:
+    serviceCode = "733|Share Mail|Alternative Postage (Share Mail) Unique Imb|Nonautomation with IMb IV";
+    break;
+  case 734:
+    serviceCode = "734|Share Mail|Alternative Postage (Share Mail) Static Imb|Nonautomation with IMb IV";
+    break;
+  case 784:
+    serviceCode = "784|Periodicals|OneCode ACS|Nonautomation w/o IMb IV";
+  
+}
+
+document.getElementById("demo").innerHTML = "Service code: " + serviceCode;
+
+}
+
+//end of Service code function New
+
+
+
+function try_repair(possible, chars, pos) {
+
+  var p = possible[pos];
+
+  var inf = null, newinf;
+
+  var n, len = p.length;
+
+  for (n = 0; n < len; n++) {
+
+    chars[pos] = p[n];
+
+    if (pos < 9)
+
+      newinf = try_repair(possible, chars, pos+1);
+
+    else {
+
+      newinf = decode_chars(chars);
+
+      if (newinf) {
+
+        newinf.suggest = chars_to_text(chars);
+
+        newinf.message = "Damaged barcode";
+
+      }
+
+    }
+
+    if (newinf) {
+
+      // abort if multiple solutions are found.
+
+      if (inf) return { message: "Invalid barcode" }
+
+      inf = newinf;
+
+    }
+
+  }
+
+  return inf;
+
+}
+
+
+
+function repair_chars(chars) {
+
+  var n, c, d, bit;
+
+  var possible = new Array(10);
+
+  var prod = 1;
+
+  for (n = 0; n < 10; n++) {
+
+    possible[n] = new Array();
+
+    c = chars[n];
+
+    if (decode_table[c] === undefined) {
+
+      for (bit = 0; bit < 13; bit++) {
+
+        d = c ^ (1 << bit);
+
+        if (decode_table[d] !== undefined)
+
+          possible[n].push(d);
+
+      }
+
+    }
+
+    else {
+
+      possible[n].push(c);
+
+    }
+
+    // Don't let the number of possible combinations get too high --
+
+    // it will take too long to run, and it won't find a unique
+
+    // solution anyway.
+
+    prod *= possible[n].length;
+
+    if (prod == 0 || prod > 1000) return null;
+
+  }
+
+  var newchars = new Array(10);
+
+  return try_repair(possible, newchars, 0);
+
+}
+
+
+
+function flip_barcode(barcode) {
+
+  var flipped = "";
+
+  var n, c;
+
+  for (n = barcode.length - 1; n >= 0; n--) {
+
+    c = barcode.charAt(n);
+
+    if (c == "A")
+
+      flipped += "D";
+
+    else if (c == "D")
+
+      flipped += "A";
+
+    else
+
+      flipped += c;
+
+  }
+
+  return flipped;
+
+}
+
+
+
+function repair_barcode(barcode) {
+
+  var pos, n, errs, chars, testcode;
+
+
+
+  var longer;
+
+  if (barcode.length == 64)
+
+    longer = true;
+
+  else if (barcode.length == 66)
+
+    longer = false;
+
+  else
+
+    return barcode;
+
+
+
+  var best = barcode;
+
+  var besterrs = 5;  // don't try to repair if we can't get more than 5 right
+
+
+
+  for (pos = 0; pos < 66; pos++) {
+
+    if (longer)
+
+      testcode = barcode.substring(0, pos) + "X" + barcode.substring(pos);
+
+    else
+
+      testcode = barcode.substring(0, pos) + barcode.substring(pos+1);
+
+    chars = text_to_chars(testcode, false);
+
+    errs = 0;
+
+    for (n = 0; n < 10; n++)
+
+      if (decode_table[chars[n]] === undefined)
+
+        errs++;
+
+    if (errs < besterrs) {
+
+      besterrs = errs;
+
+      best = testcode;
+
+    }
+
+  }
+
+
+
+  return best;
+
+}
+
+
+
+function find_diffs(str1, str2) {
+
+  var len = Math.min(str1.length, str2.length);
+
+  var diffs = new Array(len);
+
+  var n;
+
+  for (n = 0; n < len; n++)
+
+    diffs[n] = str1.charAt(n) != str2.charAt(n);
+
+  return diffs;
+
+}
+
+
+
+function decode_barcode(barcode) {
+
+  var chars, inf;
+
+
+
+  barcode = despace(barcode.toUpperCase());
+
+  if (barcode.length == 65) {
+
+    chars = text_to_chars(barcode, true);
+
+    if (chars) {
+
+      inf = decode_chars(chars);
+
+      if (inf) return inf;  // decoded with no errors
+
+    }
+
+  }
+
+
+
+  barcode = repair_barcode(barcode);
+
+  if (barcode.length != 65)
+
+    return { message: "Barcode must be 65 characters long" };
+
+
+
+  chars = text_to_chars(barcode, false);
+
+  inf = repair_chars(chars);
+
+  if (inf) {
+
+    if (inf.suggest)
+
+      inf.highlight = find_diffs(barcode, inf.suggest);
+
+    return inf;
+
+  }
+
+
+
+  barcode = flip_barcode(barcode);
+
+  chars = text_to_chars(barcode, false);
+
+  inf = repair_chars(chars);
+
+  if (inf && inf.barcode_id) {
+
+    inf.message = "Barcode seems to be upside down";
+
+    return inf;
+
+  }
+
+
+
+  return { message: "Invalid barcode" };
+
+}
+
+
+
+function check_fields(inf) {
+
+  var field;
+
+  for (field in inf)
+
+    inf[field] = despace(inf[field]);
+
+
+
+  if (inf.zip != "")
+
+    if (nondigits(inf.zip) || inf.zip.length != 5)
+
+      return "Zip code must be 5 digits";
+
+  if (inf.plus4 != "") {
+
+    if (inf.zip == "")
+
+      return "Zip code required";
+
+    if (nondigits(inf.plus4) || inf.plus4.length != 4)
+
+      return "Zip+4 must be 4 digits";
+
+  }
+
+  if (inf.delivery_pt != "") {
+
+    if (inf.plus4 == "")
+
+      return "Zip+4 required";
+
+    if (nondigits(inf.delivery_pt) || inf.delivery_pt.length != 2)
+
+      return "Delivery Point must be 2 digits";
+
+  }
+
+
+
+  if (nondigits(inf.barcode_id) || inf.barcode_id.length != 2)
+
+    return "Barcode ID must be 2 digits";
+
+  if (inf.barcode_id.charAt(1) >= "5")
+
+    return "Second digit of Barcode ID must be 0-4";
+
+  if (nondigits(inf.service_type) || inf.service_type.length != 3)
+
+    return "Service Type must be 3 digits";
+
+  if (nondigits(inf.mailer_id) ||
+
+      inf.mailer_id.length != 6 && inf.mailer_id.length != 9)
+
+    return "Mailer ID must be 6 or 9 digits";
+
+  if (inf.mailer_id.charAt(0) == '9') {
+
+    if (inf.mailer_id.length != 9)
+
+      return "Mailer ID with leading 9 must be 9 digits long";
+
+  }
+
+  else {
+
+    if (inf.mailer_id.length != 6)
+
+      return "Mailer ID without leading 9 must be 6 digits long";
+
+  }
+
+  if (nondigits(inf.serial_num) ||
+
+      inf.serial_num.length + inf.mailer_id.length != 15)
+
+    return "Serial Number must be " + (15 - inf.mailer_id.length) + " digits";
+
+
+
+  return null;
+
+}
+
+
+
+function encode_fields(inf) {
+
+  var n;
+
+  var bytes = [0,0,0,0,0,0,0,0,0,0,0,0,0];
+
+  var marker = 0;
+
+  if (inf.zip != "") {
+
+    bytes[12] = parseInt(inf.zip,10);
+
+    marker += 1;
+
+  }
+
+  if (inf.plus4 != "") {
+
+    muladd(bytes, 10000, parseInt(inf.plus4,10));
+
+    marker += 100000;
+
+  }
+
+  if (inf.delivery_pt != "") {
+
+    muladd(bytes, 100, parseInt(inf.delivery_pt,10));
+
+    marker += 1000000000;
+
+  }
+
+  add(bytes, marker);
+
+
+
+  muladd(bytes, 10, parseInt(inf.barcode_id.charAt(0),10));
+
+  muladd(bytes, 5, parseInt(inf.barcode_id.charAt(1),10));
+
+  muladd(bytes, 1000, parseInt(inf.service_type,10));
+
+  if (inf.mailer_id.length == 6) {
+
+    muladd(bytes, 1000000, parseInt(inf.mailer_id,10));
+
+    muladd(bytes, 100000, 0);  // multiply in two steps to avoid overflow
+
+    muladd(bytes, 10000, parseInt(inf.serial_num,10));
+
+  }
+
+  else {
+
+    muladd(bytes, 10000, 0);
+
+    muladd(bytes, 100000, parseInt(inf.mailer_id,10));
+
+    muladd(bytes, 1000000, parseInt(inf.serial_num,10));
+
+  }
+
+
+
+  var fcs = calcfcs(bytes);
+
+
+
+  var cw = new Array(10);
+
+  cw[9] = divmod(bytes, 636) << 1;
+
+  for (n = 8; n > 0; n--)
+
+    cw[n] = divmod(bytes, 1365);
+
+  cw[0] = (bytes[11]<<8) + bytes[12];
+
+  if (fcs & (1 << 10)) cw[0] += 659;
+
+
+
+  var chars = new Array(10);
+
+  for (n = 0; n < 10; n++) {
+
+    chars[n] = encode_table[cw[n]];
+
+    if (fcs & (1 << n)) chars[n] ^= 8191;
+
+  }
+
+
+
+  return chars_to_text(chars);
+
+}
+
+
+
+function highlight(str, high) {
+
+  var out = "";
+
+  var n, len = str.length;
+
+  for (n = 0; n < len; n++) {
+
+    if (high[n])
+
+      out += '<font color="red">' + str.charAt(n) + '</font>';
+
+    else
+
+      out += str.charAt(n);
+
+  }
+
+  return out;
+
+}
+
+
+
+var barcode_fields = [ "zip", "plus4", "delivery_pt", "barcode_id",
+
+   "service_type", "mailer_id", "serial_num" ];
+
+
+
+function do_decode() {
+
+  var i;
+
+
+
+  var message_span = document.getElementById("messagespan");
+
+  message_span.innerHTML = "";
+
+
+
+  var encode_form = document.forms.encodeform;
+
+  for (i = 0; i < barcode_fields.length; i++)
+
+    encode_form[barcode_fields[i]].value = "";
+
+
+
+  var decode_form = document.forms.decodeform;
+
+  var inf = decode_barcode(decode_form.barcode.value);
+
+
+
+  var msg = "";
+
+  if ("message" in inf)
+
+    msg = inf.message;
+
+  if ("suggest"  in inf) {
+
+    if (msg) msg += "<br>";
+
+    msg += "Suggest replacement:<br>";
+
+    if ("highlight" in inf)
+
+      msg += highlight(inf.suggest, inf.highlight);
+
+    else
+
+      msg += inf.suggest;
+
+  }
+
+  message_span.innerHTML = msg;
+
+
+
+  for (i = 0; i < barcode_fields.length; i++)
+
+    if (barcode_fields[i] in inf)
+
+      encode_form[barcode_fields[i]].value = inf[barcode_fields[i]];
+
+}
+
+
+
+function do_encode() {
+
+  var i;
+
+
+
+  var message_span = document.getElementById("messagespan");
+
+  message_span.innerHTML = "";
+
+
+
+  var encode_form = document.forms.encodeform;
+
+  var inf = new Object();
+
+  for (i = 0; i < barcode_fields.length; i++)
+
+    inf[barcode_fields[i]] = encode_form[barcode_fields[i]].value;
+
+
+
+  var message = check_fields(inf);
+
+  if (message)
+
+    message_span.innerHTML = message;
+
+  else {
+
+    document.forms.decodeform.barcode.value = encode_fields(inf);
+
+    update_barcode();
+
+  }
+
+}
+
+
+
+function update_barcode() {
+
+  var i;
+
+
+
+  var tbl = document.getElementById("barcodetable");
+
+  if (!tbl) return;
+
+  var rows = tbl.rows;
+
+  var top    = rows[0].cells;
+
+  var middle = rows[1].cells;
+
+  var bottom = rows[2].cells;
+
+
+
+  var barcode = document.forms.decodeform.barcode.value;
+
+  if (barcode == null) barcode = '';
+
+  barcode = despace(barcode.toUpperCase());
+
+  var len = barcode.length;
+
+  if (len > 65) len = 65;
+
+  for (i = 0; i < len; i++) {
+
+    switch (barcode.charAt(i)) {
+
+      case 'A':
+
+        top[i*2].bgColor    = '#000000';
+
+        middle[i*2].bgColor = '#000000';
+
+        bottom[i*2].bgColor = '#ffffff';
+
+        break;
+
+      case 'D':
+
+        top[i*2].bgColor    = '#ffffff';
+
+        middle[i*2].bgColor = '#000000';
+
+        bottom[i*2].bgColor = '#000000';
+
+        break;
+
+      case 'F':
+
+        top[i*2].bgColor    = '#000000';
+
+        middle[i*2].bgColor = '#000000';
+
+        bottom[i*2].bgColor = '#000000';
+
+        break;
+
+      case 'T':
+
+        top[i*2].bgColor    = '#ffffff';
+
+        middle[i*2].bgColor = '#000000';
+
+        bottom[i*2].bgColor = '#ffffff';
+
+        break;
+
+      default:
+
+        top[i*2].bgColor    = '#ff0000';
+
+        middle[i*2].bgColor = '#ff0000';
+
+        bottom[i*2].bgColor = '#ff0000';
+
+        break;
+
+    }
+
+  }
+
+  for (i = len; i < 65; i++) {
+
+    top[i*2].bgColor    = '#ffffff';
+
+    middle[i*2].bgColor = '#cccccc';
+
+    bottom[i*2].bgColor = '#ffffff';
+
+  }
+
+}
+
+</script>
+
+
+
+Please enter your barcode below, using the following characters:<br>
+
+<b>A</b> = Ascending bar, <b>D</b> = Descending bar,
+
+<b>F</b> = Full bar, <b>T</b> = Track (small) bar
+
+
+
+<!-- action could be replaced with a server-side script -->
+
+<form name="decodeform" action="fail.html" method="get">
+
+<input name="barcode" type="text" size=100 onkeyup="update_barcode()">
+
+<input name="decode" type="submit" value="Decode">
+
+</form>
+
+<script>
+
+// now that we know javascript exists, adjust the form to use it.
+
+document.forms.decodeform.action = "javascript:do_decode()";
+
+// build table to display barcode in graphical form
+
+document.write('<table id="barcodetable" cellspacing="0" border="0">');
+
+var i, j;
+
+for (i = 0; i < 3; i++) {
+
+  document.write("<tr>");
+
+  for (j = 0; j < 129; j++)
+
+    document.write('<td style="width: 2px; height: 8px"></td>');
+
+  document.write("</tr>\n");
+
+}
+
+document.write("</table>\n");
+
+</script>
+
+
+
+<span id="messagespan"></span>
+
+
+
+<form name="encodeform" action="fail.html" method="get">
+
+<table>
+
+<tr>
+
+<td>Zip:</td>
+
+<td><input name="zip" type="text" size=5>-<input name="plus4" type="text" size=4></td>
+
+</tr>
+
+<tr>
+
+<td>Delivery Point:</td>
+
+<td><input name="delivery_pt" type="text" size=2></td>
+
+</tr>
+
+<tr>
+
+<td>Barcode ID:</td>
+
+<td><input name="barcode_id" type="text" size=2></td>
+
+</tr>
+
+<tr>
+
+<td>Service Type:</td>
+
+<td><input name="service_type" type="text" size=3></td>
+
+</tr>
+
+<tr>
+
+<td>Mailer ID:</td>
+
+<td><input name="mailer_id" type="text" size=9></td>
+
+</tr>
+
+<tr>
+
+<td>Serial Number:</td>
+
+<td><input name="serial_num" type="text" size=9></td>
+
+</tr>
+
+<tr>
+
+<td></td>
+
+<td><input name="encode" type="submit" value="Encode"></td>
+
+</tr>
+
+</table>
+
+</form>
+
+<script>
+
+document.forms.encodeform.action = "javascript:do_encode()";
+//debugger;
+</script>
+
+
+<p style="background-color:green;color:white;font-size:xx-large;"id="demo"></p>
+</body>
+
+</html>
+
